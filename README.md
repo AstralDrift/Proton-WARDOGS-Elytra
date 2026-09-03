@@ -2,6 +2,14 @@
 
 Experimental Proton/Wine compatibility work for **WARDOGS Playtest**.
 
+> [!WARNING]
+> **Multiplayer is not currently working reliably.** The patched runtime can
+> launch the game, enter the firing range, and connect to a server, but testing
+> on September 3, 2026 ended in a server kick with `no valid heartbeat within
+> window`. This strongly indicates that Elytra's runtime heartbeat is not being
+> validated under Proton. Treat this release as an investigation build, not a
+> multiplayer-ready fix.
+
 - Steam App ID: `4809930`
 - Initially developed against Build ID: `25078803`
 - Also exercised against Build ID: `25098628`
@@ -9,7 +17,12 @@ Experimental Proton/Wine compatibility work for **WARDOGS Playtest**.
 
 ## Status
 
-The patched runtime has launched WARDOGS through the Elytra launcher and reached the playable firing range on Linux. Multiplayer-server availability is controlled by the WARDOGS test schedule and is not guaranteed by this patch.
+The patched runtime has launched WARDOGS through the Elytra launcher, reached
+the playable firing range on Linux, and connected to a multiplayer server.
+However, the server subsequently kicked the client because no valid anti-cheat
+heartbeat arrived within the required window. Module installation and initial
+launch compatibility are therefore improved, but end-to-end Elytra multiplayer
+compatibility has **not** been achieved.
 
 This is compatibility work, **not an anti-cheat bypass**. It does not patch Elytra, modify its downloaded modules, suppress failures, spoof successful checks, or disable validation. The changes implement missing Wine behavior and return real failures from Wine's driver and cryptography paths.
 
@@ -60,4 +73,3 @@ Source branch and commit:
 ## Important
 
 This is an unofficial test build. WARDOGS currently advertises Windows support, and its developers can change Elytra or the game build at any time. Do not use DLL overrides, unsigned replacement modules, launcher bypasses, or modified anti-cheat files.
-
