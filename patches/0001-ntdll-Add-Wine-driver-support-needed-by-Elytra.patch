@@ -1,0 +1,575 @@
+From 86e5df23b4b7acd4b25b791efcbf466f476dfead Mon Sep 17 00:00:00 2001
+From: AstralDrift <190562877+AstralDrift@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 13:39:29 -0500
+Subject: [PATCH 1/3] ntdll: Add Wine driver support needed by Elytra
+
+---
+ dlls/bcrypt/gnutls.c            |  16 +++-
+ dlls/ksecdd.sys/ksecdd.sys.spec |  62 ++++++------
+ dlls/ntdll/ntdll.spec           |   3 +-
+ dlls/ntdll/rtlstr.c             |  31 ++++--
+ dlls/ntdll/sec.c                | 162 ++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/system.c        |  10 --
+ dlls/ntoskrnl.exe/ntoskrnl.c    |  75 ++++++++++++++-
+ include/winternl.h              |   1 +
+ server/device.c                 |   5 +-
+ 9 files changed, 310 insertions(+), 55 deletions(-)
+
+diff --git a/dlls/bcrypt/gnutls.c b/dlls/bcrypt/gnutls.c
+index 4603c7d..c821083 100644
+--- a/dlls/bcrypt/gnutls.c
++++ b/dlls/bcrypt/gnutls.c
+@@ -932,17 +932,31 @@ static NTSTATUS key_symmetric_encrypt( void *args )
+ static NTSTATUS key_symmetric_decrypt( void *args )
+ {
+     const struct key_symmetric_decrypt_params *params = args;
++    unsigned char stack_input[32], *allocated_input = NULL;
++    const unsigned char *input = params->input;
+     NTSTATUS status;
+     int ret;
+ 
+     if ((status = init_cipher_handle( params->key ))) return status;
+ 
+-    if ((ret = pgnutls_cipher_decrypt2( key_data(params->key)->cipher, params->input, params->input_len,
++    /* BCrypt permits in-place operation.  Do not depend on the crypto backend
++     * preserving overlapping input while it writes the decrypted block. */
++    if ((ULONG_PTR)params->input < (ULONG_PTR)params->output + params->output_len &&
++        (ULONG_PTR)params->output < (ULONG_PTR)params->input + params->input_len)
++    {
++        if (params->input_len <= sizeof(stack_input)) input = stack_input;
++        else if (!(input = allocated_input = malloc( params->input_len ))) return STATUS_NO_MEMORY;
++        memcpy( (void *)input, params->input, params->input_len );
++    }
++
++    if ((ret = pgnutls_cipher_decrypt2( key_data(params->key)->cipher, input, params->input_len,
+                                         params->output, params->output_len )))
+     {
+         pgnutls_perror( ret );
++        free( allocated_input );
+         return STATUS_INTERNAL_ERROR;
+     }
++    free( allocated_input );
+     return STATUS_SUCCESS;
+ }
+ 
+diff --git a/dlls/ksecdd.sys/ksecdd.sys.spec b/dlls/ksecdd.sys/ksecdd.sys.spec
+index 31b1b35..a4654d6 100644
+--- a/dlls/ksecdd.sys/ksecdd.sys.spec
++++ b/dlls/ksecdd.sys/ksecdd.sys.spec
+@@ -3,41 +3,41 @@
+ @ stub AcquireCredentialsHandleW
+ @ stub AddCredentialsW
+ @ stub ApplyControlToken
+-@ stub BCryptCloseAlgorithmProvider
+-@ stub BCryptCreateHash
+-@ stub BCryptDecrypt
+-@ stub BCryptDeriveKey
+-@ stub BCryptDeriveKeyCapi
+-@ stub BCryptDeriveKeyPBKDF2
+-@ stub BCryptDestroyHash
+-@ stub BCryptDestroyKey
+-@ stub BCryptDestroySecret
+-@ stub BCryptDuplicateHash
+-@ stub BCryptDuplicateKey
+-@ stub BCryptEncrypt
+-@ stub BCryptEnumAlgorithms
++@ stdcall BCryptCloseAlgorithmProvider(ptr long) bcrypt.BCryptCloseAlgorithmProvider
++@ stdcall BCryptCreateHash(ptr ptr ptr long ptr long long) bcrypt.BCryptCreateHash
++@ stdcall BCryptDecrypt(ptr ptr long ptr ptr long ptr long ptr long) bcrypt.BCryptDecrypt
++@ stdcall BCryptDeriveKey(ptr wstr ptr ptr long ptr long) bcrypt.BCryptDeriveKey
++@ stdcall BCryptDeriveKeyCapi(ptr ptr ptr long long) bcrypt.BCryptDeriveKeyCapi
++@ stdcall BCryptDeriveKeyPBKDF2(ptr ptr long ptr long int64 ptr long long) bcrypt.BCryptDeriveKeyPBKDF2
++@ stdcall BCryptDestroyHash(ptr) bcrypt.BCryptDestroyHash
++@ stdcall BCryptDestroyKey(ptr) bcrypt.BCryptDestroyKey
++@ stdcall BCryptDestroySecret(ptr) bcrypt.BCryptDestroySecret
++@ stdcall BCryptDuplicateHash(ptr ptr ptr long long) bcrypt.BCryptDuplicateHash
++@ stdcall BCryptDuplicateKey(ptr ptr ptr long long) bcrypt.BCryptDuplicateKey
++@ stdcall BCryptEncrypt(ptr ptr long ptr ptr long ptr long ptr long) bcrypt.BCryptEncrypt
++@ stdcall BCryptEnumAlgorithms(long ptr ptr long) bcrypt.BCryptEnumAlgorithms
+ @ stub BCryptEnumProviders
+-@ stub BCryptExportKey
+-@ stub BCryptFinalizeKeyPair
+-@ stub BCryptFinishHash
+-@ stub BCryptFreeBuffer
+-@ stub BCryptGenRandom
+-@ stub BCryptGenerateKeyPair
+-@ stub BCryptGenerateSymmetricKey
+-@ stub BCryptGetFipsAlgorithmMode
+-@ stub BCryptGetProperty
+-@ stub BCryptHashData
+-@ stub BCryptImportKey
+-@ stub BCryptImportKeyPair
+-@ stub BCryptKeyDerivation
+-@ stub BCryptOpenAlgorithmProvider
++@ stdcall BCryptExportKey(ptr ptr wstr ptr long ptr long) bcrypt.BCryptExportKey
++@ stdcall BCryptFinalizeKeyPair(ptr long) bcrypt.BCryptFinalizeKeyPair
++@ stdcall BCryptFinishHash(ptr ptr long long) bcrypt.BCryptFinishHash
++@ stdcall BCryptFreeBuffer(ptr) bcrypt.BCryptFreeBuffer
++@ stdcall BCryptGenRandom(ptr ptr long long) bcrypt.BCryptGenRandom
++@ stdcall BCryptGenerateKeyPair(ptr ptr long long) bcrypt.BCryptGenerateKeyPair
++@ stdcall BCryptGenerateSymmetricKey(ptr ptr ptr long ptr long long) bcrypt.BCryptGenerateSymmetricKey
++@ stdcall BCryptGetFipsAlgorithmMode(ptr) bcrypt.BCryptGetFipsAlgorithmMode
++@ stdcall BCryptGetProperty(ptr wstr ptr long ptr long) bcrypt.BCryptGetProperty
++@ stdcall BCryptHashData(ptr ptr long long) bcrypt.BCryptHashData
++@ stdcall BCryptImportKey(ptr ptr wstr ptr ptr long ptr long long) bcrypt.BCryptImportKey
++@ stdcall BCryptImportKeyPair(ptr ptr wstr ptr ptr long long) bcrypt.BCryptImportKeyPair
++@ stdcall BCryptKeyDerivation(ptr ptr ptr long ptr long) bcrypt.BCryptKeyDerivation
++@ stdcall BCryptOpenAlgorithmProvider(ptr wstr wstr long) bcrypt.BCryptOpenAlgorithmProvider
+ @ stub BCryptRegisterConfigChangeNotify
+ @ stub BCryptResolveProviders
+-@ stub BCryptSecretAgreement
+-@ stub BCryptSetProperty
+-@ stub BCryptSignHash
++@ stdcall BCryptSecretAgreement(ptr ptr ptr long) bcrypt.BCryptSecretAgreement
++@ stdcall BCryptSetProperty(ptr wstr ptr long long) bcrypt.BCryptSetProperty
++@ stdcall BCryptSignHash(ptr ptr ptr long ptr long ptr long) bcrypt.BCryptSignHash
+ @ stub BCryptUnregisterConfigChangeNotify
+-@ stub BCryptVerifySignature
++@ stdcall BCryptVerifySignature(ptr ptr ptr long ptr long long) bcrypt.BCryptVerifySignature
+ @ stub CompleteAuthToken
+ @ stub CredMarshalTargetInfo
+ @ stub DeleteSecurityContext
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 32b1d5e..94053ac 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -253,7 +253,7 @@
+ @ stdcall -syscall=0x004f NtIsProcessInJob(long long)
+ # @ stub NtIsSystemResumeAutomatic
+ @ stdcall -syscall NtListenPort(ptr ptr)
+-@ stdcall -syscall NtLoadDriver(ptr)
++@ stdcall NtLoadDriver(ptr)
+ @ stdcall -syscall NtLoadKey2(ptr ptr long)
+ @ stdcall -syscall NtLoadKey(ptr ptr)
+ @ stdcall -syscall NtLoadKeyEx(ptr ptr long long long long ptr ptr)
+@@ -1051,6 +1051,7 @@
+ @ stub RtlStartRXact
+ # @ stub RtlStatMemoryStream
+ @ stdcall RtlStringFromGUID(ptr ptr)
++@ stdcall RtlStringFromGUIDEx(ptr ptr long)
+ @ stdcall RtlSubAuthorityCountSid(ptr)
+ @ stdcall RtlSubAuthoritySid(ptr long)
+ @ stdcall RtlSubtreePredecessor(ptr)
+diff --git a/dlls/ntdll/rtlstr.c b/dlls/ntdll/rtlstr.c
+index f494d97..6bf5903 100644
+--- a/dlls/ntdll/rtlstr.c
++++ b/dlls/ntdll/rtlstr.c
+@@ -1683,18 +1683,25 @@ NTSTATUS WINAPI RtlGUIDFromString(PUNICODE_STRING str, GUID* guid)
+  * SEE ALSO
+  *  See RtlGUIDFromString.
+  */
+-NTSTATUS WINAPI RtlStringFromGUID(const GUID* guid, UNICODE_STRING *str)
++NTSTATUS WINAPI RtlStringFromGUIDEx(const GUID *guid, UNICODE_STRING *str, BOOLEAN allocate)
+ {
+-  TRACE("(%p,%p)\n", guid, str);
++  TRACE("(%p,%p,%u)\n", guid, str, allocate);
++
++  if (allocate)
++  {
++    str->Length = GUID_STRING_LENGTH * sizeof(WCHAR);
++    str->MaximumLength = str->Length + sizeof(WCHAR);
++    str->Buffer = RtlAllocateHeap(GetProcessHeap(), 0, str->MaximumLength);
++    if (!str->Buffer)
++    {
++      str->Length = str->MaximumLength = 0;
++      return STATUS_NO_MEMORY;
++    }
++  }
++  else if (!str->Buffer || str->MaximumLength < (GUID_STRING_LENGTH + 1) * sizeof(WCHAR))
++    return STATUS_BUFFER_TOO_SMALL;
+ 
+   str->Length = GUID_STRING_LENGTH * sizeof(WCHAR);
+-  str->MaximumLength = str->Length + sizeof(WCHAR);
+-  str->Buffer = RtlAllocateHeap(GetProcessHeap(), 0, str->MaximumLength);
+-  if (!str->Buffer)
+-  {
+-    str->Length = str->MaximumLength = 0;
+-    return STATUS_NO_MEMORY;
+-  }
+   swprintf(str->Buffer, str->MaximumLength/sizeof(WCHAR),
+           L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", guid->Data1, guid->Data2, guid->Data3,
+           guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3],
+@@ -1703,6 +1710,12 @@ NTSTATUS WINAPI RtlStringFromGUID(const GUID* guid, UNICODE_STRING *str)
+   return STATUS_SUCCESS;
+ }
+ 
++NTSTATUS WINAPI RtlStringFromGUID(const GUID* guid, UNICODE_STRING *str)
++{
++  TRACE("(%p,%p)\n", guid, str);
++  return RtlStringFromGUIDEx(guid, str, TRUE);
++}
++
+ 
+ /***********************************************************************
+  * Message formatting
+diff --git a/dlls/ntdll/sec.c b/dlls/ntdll/sec.c
+index f254363..5909351 100644
+--- a/dlls/ntdll/sec.c
++++ b/dlls/ntdll/sec.c
+@@ -30,6 +30,8 @@
+ #define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winreg.h"
++#include "winsvc.h"
+ #include "tomcrypt.h"
+ #include "ntdll_misc.h"
+ #include "ddk/ntddk.h"
+@@ -1688,6 +1690,166 @@ RtlAdjustPrivilege(ULONG Privilege,
+     return STATUS_SUCCESS;
+ }
+ 
++/*
++ * NtLoadDriver is normally a kernel syscall.  Wine hosts native PE drivers in
++ * winedevice.exe, which is started and supervised by services.exe.  Route the
++ * request through the SCM so that the existing driver host performs the real
++ * image load and DriverEntry call; do not report success unless that path does.
++ *
++ * ntdll cannot import advapi32 without introducing a loader cycle, so resolve
++ * the small SCM surface lazily after process initialization.
++ */
++NTSTATUS WINAPI NtLoadDriver( const UNICODE_STRING *key_name )
++{
++    static const WCHAR services_prefix[] = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\";
++    static HMODULE advapi32;
++    static HANDLE (WINAPI *pOpenSCManagerW)( const WCHAR *, const WCHAR *, DWORD );
++    static HANDLE (WINAPI *pOpenServiceW)( HANDLE, const WCHAR *, DWORD );
++    static HANDLE (WINAPI *pCreateServiceW)( HANDLE, const WCHAR *, const WCHAR *, DWORD, DWORD,
++                                             DWORD, DWORD, const WCHAR *, const WCHAR *, DWORD *,
++                                             const WCHAR *, const WCHAR *, const WCHAR * );
++    static BOOL (WINAPI *pStartServiceW)( HANDLE, DWORD, const WCHAR ** );
++    static BOOL (WINAPI *pCloseServiceHandle)( HANDLE );
++    static LSTATUS (WINAPI *pRegOpenKeyExW)( HKEY, const WCHAR *, DWORD, REGSAM, HKEY * );
++    static LSTATUS (WINAPI *pRegQueryValueExW)( HKEY, const WCHAR *, DWORD *, DWORD *, BYTE *, DWORD * );
++    static LSTATUS (WINAPI *pRegCloseKey)( HKEY );
++    ANSI_STRING proc_name;
++    UNICODE_STRING module_name = RTL_CONSTANT_STRING(L"advapi32.dll");
++    PRIVILEGE_SET required;
++    BOOLEAN allowed = FALSE;
++    HANDLE token = 0, manager = 0, service = 0;
++    WCHAR *name, *image_path = NULL, *registry_path = NULL;
++    HKEY driver_key = 0;
++    DWORD error, open_error = ERROR_SUCCESS, type = SERVICE_KERNEL_DRIVER;
++    DWORD start = SERVICE_DEMAND_START, error_control = SERVICE_ERROR_NORMAL, size, value_type;
++    NTSTATUS status;
++    unsigned int prefix_len = ARRAY_SIZE(services_prefix) - 1;
++
++    TRACE("(%s)\n", debugstr_us(key_name));
++
++    if (!key_name || !key_name->Buffer || (key_name->Length & 1) ||
++        key_name->Length <= prefix_len * sizeof(WCHAR) ||
++        wcsnicmp(key_name->Buffer, services_prefix, prefix_len))
++        return STATUS_INVALID_PARAMETER;
++
++    required.PrivilegeCount = 1;
++    required.Control = PRIVILEGE_SET_ALL_NECESSARY;
++    required.Privilege[0].Luid.LowPart = SE_LOAD_DRIVER_PRIVILEGE;
++    required.Privilege[0].Luid.HighPart = 0;
++    required.Privilege[0].Attributes = SE_PRIVILEGE_ENABLED;
++
++    status = NtOpenThreadToken(GetCurrentThread(), TOKEN_QUERY, FALSE, &token);
++    if (status == STATUS_NO_TOKEN)
++        status = NtOpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token);
++    if (status) return status;
++    status = NtPrivilegeCheck(token, &required, &allowed);
++    NtClose(token);
++    if (status) return status;
++    if (!allowed) return STATUS_PRIVILEGE_NOT_HELD;
++
++    if (!advapi32 && (status = LdrLoadDll(NULL, NULL, &module_name, &advapi32))) return status;
++
++#define RESOLVE_SCM_PROC(name) do { \
++        RtlInitAnsiString(&proc_name, #name); \
++        if ((status = LdrGetProcedureAddress(advapi32, &proc_name, 0, (void **)&p##name))) return status; \
++    } while (0)
++    if (!pOpenSCManagerW)
++    {
++        RESOLVE_SCM_PROC(OpenSCManagerW);
++        RESOLVE_SCM_PROC(OpenServiceW);
++        RESOLVE_SCM_PROC(CreateServiceW);
++        RESOLVE_SCM_PROC(StartServiceW);
++        RESOLVE_SCM_PROC(CloseServiceHandle);
++        RESOLVE_SCM_PROC(RegOpenKeyExW);
++        RESOLVE_SCM_PROC(RegQueryValueExW);
++        RESOLVE_SCM_PROC(RegCloseKey);
++    }
++#undef RESOLVE_SCM_PROC
++
++    if (!(name = RtlAllocateHeap(GetProcessHeap(), 0,
++                                 key_name->Length - prefix_len * sizeof(WCHAR) + sizeof(WCHAR))))
++        return STATUS_NO_MEMORY;
++    memcpy(name, key_name->Buffer + prefix_len,
++           key_name->Length - prefix_len * sizeof(WCHAR));
++    name[key_name->Length / sizeof(WCHAR) - prefix_len] = 0;
++    if (!name[0] || wcschr(name, '\\'))
++    {
++        RtlFreeHeap(GetProcessHeap(), 0, name);
++        return STATUS_INVALID_PARAMETER;
++    }
++
++    manager = pOpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
++    if (manager)
++    {
++        service = pOpenServiceW(manager, name, SERVICE_START | SERVICE_QUERY_STATUS);
++        if (!service) open_error = RtlGetLastWin32Error();
++    }
++
++    /* Native callers may create a driver service by writing its registry key
++     * directly before NtLoadDriver().  services.exe caches its database, so
++     * import that configuration through CreateServiceW when necessary. */
++    if (manager && !service && open_error == ERROR_SERVICE_DOES_NOT_EXIST)
++    {
++        static const WCHAR registry_prefix[] = L"SYSTEM\\CurrentControlSet\\Services\\";
++        unsigned int registry_len = ARRAY_SIZE(registry_prefix) + wcslen(name);
++
++        if ((registry_path = RtlAllocateHeap(GetProcessHeap(), 0, registry_len * sizeof(WCHAR))))
++        {
++            wcscpy(registry_path, registry_prefix);
++            wcscat(registry_path, name);
++            if (!pRegOpenKeyExW(HKEY_LOCAL_MACHINE, registry_path, 0, KEY_QUERY_VALUE, &driver_key))
++            {
++                size = sizeof(type);
++                pRegQueryValueExW(driver_key, L"Type", NULL, &value_type, (BYTE *)&type, &size);
++                size = sizeof(start);
++                pRegQueryValueExW(driver_key, L"Start", NULL, &value_type, (BYTE *)&start, &size);
++                size = sizeof(error_control);
++                pRegQueryValueExW(driver_key, L"ErrorControl", NULL, &value_type,
++                                  (BYTE *)&error_control, &size);
++                size = 0;
++                error = pRegQueryValueExW(driver_key, L"ImagePath", NULL, &value_type, NULL, &size);
++                if ((error == ERROR_SUCCESS || error == ERROR_MORE_DATA) &&
++                    (value_type == REG_SZ || value_type == REG_EXPAND_SZ) &&
++                    (image_path = RtlAllocateHeap(GetProcessHeap(), HEAP_ZERO_MEMORY, size + sizeof(WCHAR))))
++                {
++                    if (!pRegQueryValueExW(driver_key, L"ImagePath", NULL, &value_type,
++                                           (BYTE *)image_path, &size) &&
++                        (type == SERVICE_KERNEL_DRIVER || type == SERVICE_FILE_SYSTEM_DRIVER))
++                        service = pCreateServiceW(manager, name, name,
++                                                  SERVICE_START | SERVICE_QUERY_STATUS,
++                                                  type, start, error_control, image_path,
++                                                  NULL, NULL, NULL, NULL, NULL);
++                }
++                pRegCloseKey(driver_key);
++            }
++        }
++    }
++    RtlFreeHeap(GetProcessHeap(), 0, name);
++    RtlFreeHeap(GetProcessHeap(), 0, registry_path);
++    RtlFreeHeap(GetProcessHeap(), 0, image_path);
++    if (service && pStartServiceW(service, 0, NULL)) error = ERROR_SUCCESS;
++    else error = RtlGetLastWin32Error();
++    if (service) pCloseServiceHandle(service);
++    if (manager) pCloseServiceHandle(manager);
++
++    switch (error)
++    {
++    case ERROR_SUCCESS:                 return STATUS_SUCCESS;
++    case ERROR_ACCESS_DENIED:           return STATUS_ACCESS_DENIED;
++    case ERROR_FILE_NOT_FOUND:
++    case ERROR_PATH_NOT_FOUND:
++    case ERROR_SERVICE_DOES_NOT_EXIST:  return STATUS_OBJECT_NAME_NOT_FOUND;
++    case ERROR_SERVICE_DISABLED:        return STATUS_UNSUCCESSFUL;
++    case ERROR_SERVICE_ALREADY_RUNNING: return STATUS_IMAGE_ALREADY_LOADED;
++    case ERROR_BAD_EXE_FORMAT:          return STATUS_INVALID_IMAGE_FORMAT;
++    case ERROR_NOT_ENOUGH_MEMORY:       return STATUS_NO_MEMORY;
++    case ERROR_INVALID_PARAMETER:       return STATUS_INVALID_PARAMETER;
++    default:
++        WARN("driver service start failed with Win32 error %lu\n", error);
++        return STATUS_UNSUCCESSFUL;
++    }
++}
++
+ /******************************************************************************
+  *  RtlImpersonateSelf		[NTDLL.@]
+  *
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 1821c6e..d7b58a8 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -4961,16 +4961,6 @@ NTSTATUS WINAPI NtPowerInformation( POWER_INFORMATION_LEVEL level, void *input,
+ }
+ 
+ 
+-/******************************************************************************
+- *              NtLoadDriver  (NTDLL.@)
+- */
+-NTSTATUS WINAPI NtLoadDriver( const UNICODE_STRING *name )
+-{
+-    FIXME( "(%s), stub!\n", debugstr_us(name) );
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-
+ /******************************************************************************
+  *              NtUnloadDriver  (NTDLL.@)
+  */
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index b3f4575..a9c0628 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -54,6 +54,9 @@ typedef struct _KSERVICE_TABLE_DESCRIPTOR
+ KSERVICE_TABLE_DESCRIPTOR KeServiceDescriptorTable[4] = { { 0 } };
+ 
+ #define MAX_SERVICE_NAME 260
++#define DEFAULT_SECURITY_COOKIE_64 (((ULONGLONG)0x00002b99 << 32) | 0x2ddfa232)
++#define DEFAULT_SECURITY_COOKIE_32 0xbb40e64e
++#define DEFAULT_SECURITY_COOKIE_16 (DEFAULT_SECURITY_COOKIE_32 >> 16)
+ 
+ static TP_POOL *dpc_call_tp;
+ static TP_CALLBACK_ENVIRON dpc_call_tpe;
+@@ -79,6 +82,8 @@ struct irp_data
+     IRP *irp;
+     BOOL async;
+     BOOL complete;
++    IO_SECURITY_CONTEXT security_context;
++    ACCESS_STATE access_state;
+ };
+ 
+ static int wine_drivers_rb_compare( const void *key, const struct wine_rb_entry *entry )
+@@ -515,6 +520,7 @@ struct dispatch_context
+ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_context *context )
+ {
+     struct irp_data *irp_data;
++    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation( irp );
+     LARGE_INTEGER count;
+     NTSTATUS status;
+ 
+@@ -525,6 +531,21 @@ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_c
+     irp_data->async = FALSE;
+     irp_data->complete = FALSE;
+ 
++    if (stack->MajorFunction == IRP_MJ_CREATE)
++    {
++        memset( &irp_data->access_state, 0, sizeof(irp_data->access_state) );
++        /* The server has already granted the handle by the time the create
++         * IRP is dispatched, so no access bits remain to be checked. */
++        irp_data->access_state.RemainingDesiredAccess = 0;
++        irp_data->access_state.PreviouslyGrantedAccess = context->params.create.access;
++        irp_data->access_state.OriginalDesiredAccess = context->params.create.access;
++        memset( &irp_data->security_context, 0, sizeof(irp_data->security_context) );
++        irp_data->security_context.AccessState = &irp_data->access_state;
++        irp_data->security_context.DesiredAccess = context->params.create.access;
++        irp_data->security_context.FullCreateOptions = context->params.create.options;
++        stack->Parameters.Create.SecurityContext = &irp_data->security_context;
++    }
++
+     IoSetCompletionRoutine( irp, dispatch_irp_completion, irp_data, TRUE, TRUE, TRUE );
+     context->irp_data = irp_data;
+     context->handle = 0;
+@@ -537,6 +558,9 @@ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_c
+     KeLeaveCriticalRegion();
+     device->CurrentIrp = NULL;
+ 
++    TRACE( "IRP major %#x returned %#lx, iosb %#lx information %Iu\n",
++           stack->MajorFunction, status, irp->IoStatus.Status, irp->IoStatus.Information );
++
+     if (status != STATUS_PENDING && !irp_data->complete)
+         ERR( "dispatch routine returned %#lx but didn't complete the IRP\n", status );
+ 
+@@ -555,7 +579,8 @@ static NTSTATUS dispatch_create( struct dispatch_context *context )
+     if (!(file = alloc_kernel_object( IoFileObjectType, handle, sizeof(*file), 0 )))
+         return STATUS_NO_MEMORY;
+ 
+-    TRACE( "device %p -> file %p\n", device, file );
++    TRACE( "device %p -> file %p, access %#x sharing %#x options %#x\n", device, file,
++           context->params.create.access, context->params.create.sharing, context->params.create.options );
+ 
+     file->Type = 5;  /* MSDN */
+     file->Size = sizeof(*file);
+@@ -568,7 +593,7 @@ static NTSTATUS dispatch_create( struct dispatch_context *context )
+     irpsp = IoGetNextIrpStackLocation( irp );
+     irpsp->MajorFunction = IRP_MJ_CREATE;
+     irpsp->FileObject = file;
+-    irpsp->Parameters.Create.SecurityContext = NULL;  /* FIXME */
++    irpsp->Parameters.Create.SecurityContext = NULL;  /* initialized by dispatch_irp */
+     irpsp->Parameters.Create.Options = context->params.create.options;
+     irpsp->Parameters.Create.ShareAccess = context->params.create.sharing;
+     irpsp->Parameters.Create.FileAttributes = 0;
+@@ -3936,6 +3961,50 @@ static WCHAR *get_windir_path( const WCHAR *path )
+     return ret;
+ }
+ 
++/* Initialize the /GS cookie in a kernel image before calling its entry point.
++ * User-mode images are handled by ntdll's loader, but native Windows performs
++ * the equivalent operation for drivers in the kernel image loader. */
++static void initialize_driver_security_cookie( HMODULE module )
++{
++    IMAGE_LOAD_CONFIG_DIRECTORY *cfg;
++    const IMAGE_NT_HEADERS *nt;
++    ULONG_PTR *cookie, value;
++    LARGE_INTEGER counter, system_time;
++    ULONG size;
++
++    if (!(nt = RtlImageNtHeader( module ))) return;
++    if (!(cfg = RtlImageDirectoryEntryToData( module, TRUE,
++                                              IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &size ))) return;
++    size = min( size, cfg->Size );
++    if (size <= offsetof( IMAGE_LOAD_CONFIG_DIRECTORY, SecurityCookie )) return;
++    if (cfg->SecurityCookie <= (ULONG_PTR)module ||
++        cfg->SecurityCookie >= (ULONG_PTR)module + nt->OptionalHeader.SizeOfImage) return;
++
++    cookie = (ULONG_PTR *)cfg->SecurityCookie;
++    if (*cookie && *cookie != DEFAULT_SECURITY_COOKIE_16 &&
++        *cookie != DEFAULT_SECURITY_COOKIE_32
++#ifdef DEFAULT_SECURITY_COOKIE_64
++        && *cookie != DEFAULT_SECURITY_COOKIE_64
++#endif
++       ) return;
++
++    NtQuerySystemTime( &system_time );
++    NtQueryPerformanceCounter( &counter, NULL );
++    value = system_time.QuadPart ^ counter.QuadPart ^ (ULONG_PTR)cookie;
++    value ^= GetCurrentProcessId() ^ ((ULONG_PTR)GetCurrentThreadId() << 16);
++#ifdef DEFAULT_SECURITY_COOKIE_64
++    value &= 0x0000ffffffffffffULL;
++#endif
++    if (!value || value == DEFAULT_SECURITY_COOKIE_16 || value == DEFAULT_SECURITY_COOKIE_32
++#ifdef DEFAULT_SECURITY_COOKIE_64
++        || value == DEFAULT_SECURITY_COOKIE_64
++#endif
++       ) value ^= 0x4711;
++
++    TRACE( "initializing driver security cookie %p\n", cookie );
++    *cookie = value;
++}
++
+ /* load the .sys module for a device driver */
+ static HMODULE load_driver( const WCHAR *driver_name, const UNICODE_STRING *keyname )
+ {
+@@ -4010,6 +4079,8 @@ static HMODULE load_driver( const WCHAR *driver_name, const UNICODE_STRING *keyn
+ 
+     module = LoadLibraryExW( str, 0, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS );
+ 
++    if (module) initialize_driver_security_cookie( module );
++
+     if (module && load_image_notify_routine_count)
+     {
+         UNICODE_STRING module_name;
+diff --git a/include/winternl.h b/include/winternl.h
+index a7ba1c1..1bc5b53 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -5257,6 +5257,7 @@ NTSYSAPI SIZE_T    WINAPI RtlSizeHeap(HANDLE,ULONG,const void*);
+ NTSYSAPI NTSTATUS  WINAPI RtlSleepConditionVariableCS(RTL_CONDITION_VARIABLE*,RTL_CRITICAL_SECTION*,const LARGE_INTEGER*);
+ NTSYSAPI NTSTATUS  WINAPI RtlSleepConditionVariableSRW(RTL_CONDITION_VARIABLE*,RTL_SRWLOCK*,const LARGE_INTEGER*,ULONG);
+ NTSYSAPI NTSTATUS  WINAPI RtlStringFromGUID(REFGUID,PUNICODE_STRING);
++NTSYSAPI NTSTATUS  WINAPI RtlStringFromGUIDEx(REFGUID,PUNICODE_STRING,BOOLEAN);
+ NTSYSAPI LPDWORD   WINAPI RtlSubAuthoritySid(PSID,DWORD);
+ NTSYSAPI LPBYTE    WINAPI RtlSubAuthorityCountSid(PSID);
+ NTSYSAPI NTSTATUS  WINAPI RtlSystemTimeToLocalTime(const LARGE_INTEGER*,PLARGE_INTEGER);
+diff --git a/server/device.c b/server/device.c
+index 3eed743..fea74a0 100644
+--- a/server/device.c
++++ b/server/device.c
+@@ -473,7 +473,10 @@ static struct object *device_open_file( struct object *obj, unsigned int access,
+         params.create.type    = IRP_CALL_CREATE;
+         params.create.access  = access;
+         params.create.sharing = sharing;
+-        params.create.options = options;
++        /* IO_STACK_LOCATION.Create.Options stores the disposition in the
++         * high byte and CreateOptions in the low 24 bits.  Opening an
++         * existing device object necessarily has FILE_OPEN disposition. */
++        params.create.options = (FILE_OPEN << 24) | (options & 0x00ffffff);
+         params.create.device  = get_kernel_object_ptr( device->manager, &device->obj );
+ 
+         if ((irp = create_irp( file, &params, NULL )))

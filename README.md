@@ -1,14 +1,15 @@
-# Proton WARDOGS – Elytra compatibility build
+# Proton WARDOGS – Elytra compatibility research build
 
 Experimental Proton/Wine compatibility work for **WARDOGS Playtest**.
 
 > [!WARNING]
-> **Multiplayer is not currently working reliably.** The patched runtime can
-> launch the game, enter the firing range, and connect to a server, but testing
-> on September 3, 2026 ended in a server kick with `no valid heartbeat within
-> window`. This strongly indicates that Elytra's runtime heartbeat is not being
-> validated under Proton. Treat this release as an investigation build, not a
-> multiplayer-ready fix.
+> **This is not currently a playable multiplayer fix.** On Build `25078803`,
+> the patched runtime reached the firing range and joined a server, but Elytra
+> kicked the client with `no valid heartbeat within window`. On Build
+> `25098628`, the authentic modules install and verify, but session preparation
+> stops earlier: Elytra refuses the game executable while loading module
+> `597ca429-3abf-43b2-aa78-73c8d7524be7` revision `43` (`0x8007001F`). Treat
+> this release only as a reproducible Wine compatibility research build.
 
 - Steam App ID: `4809930`
 - Initially developed against Build ID: `25078803`
@@ -17,16 +18,26 @@ Experimental Proton/Wine compatibility work for **WARDOGS Playtest**.
 
 ## Status
 
-The patched runtime has launched WARDOGS through the Elytra launcher, reached
-the playable firing range on Linux, and connected to a multiplayer server.
-However, the server subsequently kicked the client because no valid anti-cheat
-heartbeat arrived within the required window. Module installation and initial
-launch compatibility are therefore improved, but end-to-end Elytra multiplayer
-compatibility has **not** been achieved.
+The patches fix several real Wine gaps found while tracing Elytra. They enabled
+Build `25078803` to launch and reach a server, but did not produce a valid
+runtime heartbeat. The current Build `25098628` still downloads, verifies, and
+installs all three authentic Elytra modules, then fails during `session-prime`
+while loading the Lighthouse module.
+
+A native-Windows control run completed module installation, prepared the
+session, and launched the same game successfully. The remaining Proton failure
+is therefore local to Elytra's Windows-kernel-driver execution path. WARDOGS has
+also stated that Proton support is not enabled for this playtest build while it
+works on proper Proton emulation. A player-side Wine build cannot enable that
+vendor-side support.
 
 This is compatibility work, **not an anti-cheat bypass**. It does not patch Elytra, modify its downloaded modules, suppress failures, spoof successful checks, or disable validation. The changes implement missing Wine behavior and return real failures from Wine's driver and cryptography paths.
 
-## Install the binary release
+## Install the binary release (diagnostic testing only)
+
+Do not install this expecting working multiplayer. It is retained so Wine,
+Valve, and WARDOGS/Elytra developers can reproduce the compatibility progress
+and the remaining failure without modifying any anti-cheat binary.
 
 1. Download `Proton-WARDOGS-Elytra.tar.zst` from this repository's Releases page.
 2. Exit Steam completely.
@@ -63,13 +74,21 @@ Steam will create a clean prefix on the next launch. Moving the prefix removes l
 - valid create-IRP security context and access state
 - correct packed create disposition for device opens
 - kernel `ksecdd.sys` BCrypt forwarding
-- overlap-safe in-place symmetric decryption
+- correct overlap-safe, padded in-place symmetric decryption
+- generic access mapping for driver device opens
+- `MmMapLockedPagesSpecifyCache`
 
-Source branch and commit:
+Source branch, combined patch series, and commits:
 
 - https://github.com/AstralDrift/wine/tree/wardogs-elytra-proton-compat
+- `patches/` in this repository (applies to Valve Wine `proton_11.0`)
 - https://github.com/AstralDrift/wine/commit/86e5df2
+- https://github.com/AstralDrift/wine/commit/844889c
+- https://github.com/AstralDrift/wine/commit/686ebe9
 
 ## Important
 
-This is an unofficial test build. WARDOGS currently advertises Windows support, and its developers can change Elytra or the game build at any time. Do not use DLL overrides, unsigned replacement modules, launcher bypasses, or modified anti-cheat files.
+This is an unofficial test build. WARDOGS currently advertises Windows support,
+and its developers can change Elytra or the game build at any time. Do not use
+DLL overrides, unsigned replacement modules, launcher bypasses, modified
+anti-cheat files, or any attempt to synthesize Elytra approval/heartbeat data.

@@ -1,0 +1,198 @@
+From 844889c527f66abe20633102079ca76b302f4837 Mon Sep 17 00:00:00 2001
+From: AstralDrift <190562877+AstralDrift@users.noreply.github.com>
+Date: Thu, 3 Sep 2026 17:59:31 -0500
+Subject: [PATCH 2/3] bcrypt: Fix padded in-place symmetric decryption
+
+---
+ dlls/bcrypt/bcrypt_main.c    | 90 +++++++++++++++++++++++++-----------
+ dlls/bcrypt/tests/bcrypt.c   |  8 ++++
+ dlls/ntoskrnl.exe/ntoskrnl.c | 18 +++++++-
+ 3 files changed, 88 insertions(+), 28 deletions(-)
+
+diff --git a/dlls/bcrypt/bcrypt_main.c b/dlls/bcrypt/bcrypt_main.c
+index df2b2cf..bab6c05 100644
+--- a/dlls/bcrypt/bcrypt_main.c
++++ b/dlls/bcrypt/bcrypt_main.c
+@@ -1296,7 +1296,8 @@ static NTSTATUS key_symmetric_decrypt( struct key *key, UCHAR *input, ULONG inpu
+     struct key_symmetric_set_auth_data_params auth_params;
+     struct key_symmetric_decrypt_params decrypt_params;
+     struct key_symmetric_get_tag_params tag_params;
+-    ULONG bytes_left = input_len;
++    UCHAR trailing_blocks[32], *decrypt_output = output, *allocated_output = NULL;
++    ULONG bytes_left = input_len, padding_len = 0, trailing_len = min( input_len, sizeof(trailing_blocks) );
+     NTSTATUS status;
+ 
+     if (key->u.s.mode == CHAIN_MODE_GCM)
+@@ -1346,55 +1347,92 @@ static NTSTATUS key_symmetric_decrypt( struct key *key, UCHAR *input, ULONG inpu
+     {
+         if (output_len + key->u.s.block_size < *ret_len) return STATUS_BUFFER_TOO_SMALL;
+         if (input_len < key->u.s.block_size) return STATUS_BUFFER_TOO_SMALL;
+-        bytes_left -= key->u.s.block_size;
+     }
+     else if (output_len < *ret_len) return STATUS_BUFFER_TOO_SMALL;
+ 
+     if (key->u.s.mode == CHAIN_MODE_ECB && iv) return STATUS_INVALID_PARAMETER;
+     if ((status = key_symmetric_set_vector( key, iv, iv_len, flags & BCRYPT_BLOCK_PADDING ))) return status;
+ 
++    if (key->u.s.vector_len > sizeof(trailing_blocks)) return STATUS_NOT_SUPPORTED;
++    memcpy( trailing_blocks, input + input_len - trailing_len, trailing_len );
++
++    /* A padded decrypt may legally receive an output buffer smaller than the
++     * ciphertext. Decrypt to a full-sized temporary buffer until the padding
++     * length is known. */
++    if (output_len < input_len)
++    {
++        if (!(decrypt_output = allocated_output = malloc( input_len ))) return STATUS_NO_MEMORY;
++    }
++
+     decrypt_params.key = key;
+     decrypt_params.input = input;
+-    decrypt_params.input_len = key->u.s.block_size;
+-    decrypt_params.output = output;
+-    decrypt_params.output_len = key->u.s.block_size;
+-    while (bytes_left >= key->u.s.block_size)
++    decrypt_params.output = decrypt_output;
++
++    if (key->u.s.mode == CHAIN_MODE_ECB)
+     {
+-        if ((status = UNIX_CALL( key_symmetric_decrypt, &decrypt_params ))) return status;
+-        if (key->u.s.mode == CHAIN_MODE_ECB && (status = key_symmetric_set_vector( key, NULL, 0, TRUE )))
+-            return status;
+-        bytes_left -= key->u.s.block_size;
+-        decrypt_params.input += key->u.s.block_size;
+-        decrypt_params.output += key->u.s.block_size;
++        decrypt_params.input_len = key->u.s.block_size;
++        decrypt_params.output_len = key->u.s.block_size;
++        while (bytes_left >= key->u.s.block_size)
++        {
++            if ((status = UNIX_CALL( key_symmetric_decrypt, &decrypt_params ))) goto done;
++            if ((status = key_symmetric_set_vector( key, NULL, 0, TRUE ))) goto done;
++            bytes_left -= key->u.s.block_size;
++            decrypt_params.input += key->u.s.block_size;
++            decrypt_params.output += key->u.s.block_size;
++        }
++    }
++    else
++    {
++        /* Stateful modes must be processed in one backend operation. Some
++         * providers treat each call as an independent cipher operation and do
++         * not carry the updated CBC vector into a subsequent call. */
++        decrypt_params.input_len = input_len;
++        decrypt_params.output_len = input_len;
++        if ((status = UNIX_CALL( key_symmetric_decrypt, &decrypt_params ))) goto done;
+     }
+ 
+     if (flags & BCRYPT_BLOCK_PADDING)
+     {
+-        UCHAR *buf, *dst = decrypt_params.output;
+-        if (!(buf = malloc( key->u.s.block_size ))) return STATUS_NO_MEMORY;
+-        decrypt_params.output = buf;
+-        status = UNIX_CALL( key_symmetric_decrypt, &decrypt_params );
+-        if (!status && buf[ key->u.s.block_size - 1 ] <= key->u.s.block_size)
++        ULONG i;
++
++        padding_len = decrypt_output[input_len - 1];
++        if (!padding_len || padding_len > key->u.s.block_size)
+         {
+-            *ret_len -= buf[ key->u.s.block_size - 1 ];
+-            if (output_len < *ret_len) status = STATUS_BUFFER_TOO_SMALL;
+-            else memcpy( dst, buf, key->u.s.block_size - buf[ key->u.s.block_size - 1 ] );
++            status = STATUS_UNSUCCESSFUL;
++            goto done;
++        }
++        for (i = 1; i <= padding_len; ++i)
++            if (decrypt_output[input_len - i] != padding_len)
++            {
++                status = STATUS_UNSUCCESSFUL;
++                goto done;
++            }
++        *ret_len -= padding_len;
++        if (output_len < *ret_len)
++        {
++            status = STATUS_BUFFER_TOO_SMALL;
++            goto done;
+         }
+-        else status = STATUS_UNSUCCESSFUL; /* FIXME: invalid padding */
+-        free( buf );
+     }
+ 
+-    if (!status)
++    if (allocated_output) memcpy( output, decrypt_output, *ret_len );
++
++    if (key->u.s.vector)
+     {
+-        if (key->u.s.vector && input_len >= key->u.s.vector_len)
++        if (input_len >= key->u.s.vector_len)
+         {
+-            memcpy( key->u.s.vector, input + input_len - key->u.s.vector_len, key->u.s.vector_len );
++            memcpy( key->u.s.vector, trailing_blocks + trailing_len - key->u.s.vector_len,
++                    key->u.s.vector_len );
+             if (iv) memcpy( iv, key->u.s.vector, min( iv_len, key->u.s.vector_len ));
+         }
+-        else if (key->u.s.vector)
++        else
+             FIXME( "Unexpected vector len %lu, *ret_len %lu.\n", key->u.s.vector_len, *ret_len );
+     }
+ 
++    status = STATUS_SUCCESS;
++
++done:
++    free( allocated_output );
+     return status;
+ }
+ 
+diff --git a/dlls/bcrypt/tests/bcrypt.c b/dlls/bcrypt/tests/bcrypt.c
+index f4850c1..f999212 100644
+--- a/dlls/bcrypt/tests/bcrypt.c
++++ b/dlls/bcrypt/tests/bcrypt.c
+@@ -1814,6 +1814,14 @@ static void test_BCryptDecrypt(void)
+     ok(!memcmp(plaintext, expected2, sizeof(expected2)), "wrong data\n");
+     ok(!memcmp(ivbuf, ciphertext2 + 32 - sizeof(iv), sizeof(iv)), "wrong iv data.\n");
+ 
++    size = 0;
++    memcpy(ivbuf, iv, sizeof(iv));
++    memcpy(plaintext, ciphertext2, sizeof(ciphertext2));
++    ret = BCryptDecrypt(key, plaintext, 32, NULL, ivbuf, 16, plaintext, 32, &size, BCRYPT_BLOCK_PADDING);
++    ok(ret == STATUS_SUCCESS, "in-place decrypt got %#lx\n", ret);
++    ok(size == 17, "in-place decrypt size %lu\n", size);
++    ok(!memcmp(plaintext, expected2, sizeof(expected2)), "in-place decrypt produced wrong data\n");
++
+     size = 0;
+     memset(plaintext, 0, sizeof(plaintext));
+     ret = BCryptDecrypt(key, ciphertext2, 32, NULL, ivbuf, 16, plaintext, 17, &size, BCRYPT_BLOCK_PADDING);
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index a9c0628..bd8e19a 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -533,15 +533,29 @@ static NTSTATUS dispatch_irp( DEVICE_OBJECT *device, IRP *irp, struct dispatch_c
+ 
+     if (stack->MajorFunction == IRP_MJ_CREATE)
+     {
++        static const GENERIC_MAPPING file_mapping =
++        {
++            FILE_GENERIC_READ,
++            FILE_GENERIC_WRITE,
++            FILE_GENERIC_EXECUTE,
++            FILE_ALL_ACCESS
++        };
++        ACCESS_MASK desired_access = context->params.create.access;
++
++        /* Generic access rights are mapped by the Windows I/O manager before
++         * the driver's create dispatch routine is called.  The server passes
++         * the original mask, so perform that mapping here as part of building
++         * the kernel-visible security context. */
++        RtlMapGenericMask( &desired_access, &file_mapping );
+         memset( &irp_data->access_state, 0, sizeof(irp_data->access_state) );
+         /* The server has already granted the handle by the time the create
+          * IRP is dispatched, so no access bits remain to be checked. */
+         irp_data->access_state.RemainingDesiredAccess = 0;
+-        irp_data->access_state.PreviouslyGrantedAccess = context->params.create.access;
++        irp_data->access_state.PreviouslyGrantedAccess = desired_access;
+         irp_data->access_state.OriginalDesiredAccess = context->params.create.access;
+         memset( &irp_data->security_context, 0, sizeof(irp_data->security_context) );
+         irp_data->security_context.AccessState = &irp_data->access_state;
+-        irp_data->security_context.DesiredAccess = context->params.create.access;
++        irp_data->security_context.DesiredAccess = desired_access;
+         irp_data->security_context.FullCreateOptions = context->params.create.options;
+         stack->Parameters.Create.SecurityContext = &irp_data->security_context;
+     }
